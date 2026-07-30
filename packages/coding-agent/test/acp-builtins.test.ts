@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -515,6 +515,44 @@ describe("ACP builtin slash commands", () => {
 		expect(configNotified).toBe(0);
 	});
 
+	it("btw: returns an ephemeral side-turn answer without invoking the main agent", async () => {
+		const { output, session, runtime } = createRuntime();
+		const runEphemeralTurn = mock(async () => ({
+			replyText: "Use the cached value.",
+			assistantMessage: { role: "assistant", content: [] },
+		}));
+		Object.assign(session, { runEphemeralTurn });
+
+		const result = await executeAcpBuiltinSlashCommand("/btw why?", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output).toEqual(["Use the cached value."]);
+		expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+	});
+
+	it("goal: shows persistent goal state through the non-TUI handler", async () => {
+		const { output, session, runtime } = createRuntime();
+		Object.assign(session, {
+			getGoalModeState: () => ({
+				enabled: true,
+				mode: "active",
+				goal: {
+					objective: "Ship slash commands",
+					status: "active",
+					tokensUsed: 120,
+					tokenBudget: 1_000,
+					timeUsedSeconds: 12,
+				},
+			}),
+		});
+
+		const result = await executeAcpBuiltinSlashCommand("/goal show", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Objective: Ship slash commands");
+		expect(output[0]).toContain("120 / 1,000 tokens");
+	});
+
 	// Removed TUI-only and dropped commands fall through as false
 	it("removed commands return false (fall through to model)", async () => {
 		const removedCommands = [
@@ -529,7 +567,6 @@ describe("ACP builtin slash commands", () => {
 			"/extensions",
 			"/agents",
 			"/copy",
-			"/btw hi",
 			"/new",
 			"/drop",
 			"/handoff",

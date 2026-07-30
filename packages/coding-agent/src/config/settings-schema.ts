@@ -4336,7 +4336,7 @@ export const SETTINGS_SCHEMA = {
 
 	"goal.continuationModes": {
 		type: "array",
-		default: ["interactive"],
+		default: ["interactive", "rpc"],
 		ui: {
 			tab: "tasks",
 			group: "Modes",

@@ -947,9 +947,46 @@ export async function runRpcMode(
 		uiContext: rpcUiContext,
 	});
 
-	// Output all agent events as JSON
+	let goalContinuationTimer: NodeJS.Timeout | undefined;
+	const cancelGoalContinuation = () => {
+		if (!goalContinuationTimer) return;
+		clearTimeout(goalContinuationTimer);
+		goalContinuationTimer = undefined;
+	};
+	const scheduleGoalContinuation = () => {
+		cancelGoalContinuation();
+		if (!session.settings.get("goal.continuationModes").includes("rpc")) return;
+		const state = session.getGoalModeState();
+		if (!state?.enabled || state.goal.status !== "active") return;
+		const continuation = session.goalRuntime.buildContinuationPrompt();
+		if (!continuation) return;
+		goalContinuationTimer = setTimeout(() => {
+			goalContinuationTimer = undefined;
+			const latest = session.getGoalModeState();
+			if (session.isStreaming || !latest?.enabled || latest.goal.status !== "active") return;
+			void session.prompt(continuation, { synthetic: true, userInitiated: false }).catch(error => {
+				output({
+					type: "extension_error",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		}, 800);
+	};
 	session.subscribe(event => {
 		output(event);
+		if (event.type !== "agent_end") return;
+		if (event.isTerminal === false) return;
+		const state = session.getGoalModeState();
+		if (state?.mode === "exiting") {
+			cancelGoalContinuation();
+			const tools = session.getEnabledToolNames().filter(name => name !== "goal");
+			void session.setActiveToolsByName(tools).then(() => {
+				session.setGoalModeState(undefined);
+				session.sessionManager.appendModeChange("none");
+			});
+			return;
+		}
+		scheduleGoalContinuation();
 	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
@@ -990,12 +1027,16 @@ export async function runRpcMode(
 				if (skillResult) {
 					return success(id, "prompt", skillResult);
 				}
+				const commandOutput: string[] = [];
 				const builtinResult = await executeAcpBuiltinSlashCommand(command.message, {
 					session,
 					sessionManager: session.sessionManager,
 					settings: session.settings,
 					cwd: session.sessionManager.getCwd(),
-					output: text => output({ type: "command_output", text }),
+					output: text => {
+						commandOutput.push(text);
+						output({ type: "command_output", text });
+					},
 					refreshCommands: emitAvailableCommandsUpdate,
 					reloadPlugins: reloadPluginState,
 					notifyTitleChanged: async () => {
@@ -1016,7 +1057,7 @@ export async function runRpcMode(
 						});
 						return success(id, "prompt");
 					}
-					return success(id, "prompt", { agentInvoked: false });
+					return success(id, "prompt", { agentInvoked: false, commandOutput });
 				}
 
 				// Don't await - events will stream
@@ -1445,6 +1486,7 @@ export async function runRpcMode(
 			// the process exits. dispose() also emits `session_shutdown`, so we
 			// must NOT emit it separately here or the event fires twice. Skipping
 			// dispose left OMP-owned Chromium alive after RPC shutdown (#5643).
+			cancelGoalContinuation();
 			await session.dispose();
 			process.exit(0);
 		},
@@ -1499,6 +1541,7 @@ export async function runRpcMode(
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a
 	// prior pi.shutdown() through the coordinator makes this await settle
 	// immediately.
+	cancelGoalContinuation();
 	await session.dispose();
 	process.exit(0);
 }

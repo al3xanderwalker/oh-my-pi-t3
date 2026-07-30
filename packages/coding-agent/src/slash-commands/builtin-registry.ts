@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { type AutocompleteItem, Spacer } from "@oh-my-pi/pi-tui";
-import { APP_NAME, getMCPConfigPath, getProjectDir, logger, setProjectDir } from "@oh-my-pi/pi-utils";
+import { APP_NAME, getMCPConfigPath, getProjectDir, logger, prompt, setProjectDir } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../capability";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
@@ -36,6 +36,7 @@ import { resolveMemoryBackend } from "../memory-backend";
 import { runPauseScreen } from "../modes/components/pause-screen";
 import { collectMcpServerNames } from "../modes/controllers/mcp-command-controller";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
+import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import { theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
 import { extractLastCodeBlock, extractLastCommand } from "../modes/utils/copy-targets";
@@ -462,6 +463,98 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (runtime.ctx.planModeEnabled) return "Goal: blocked by plan mode";
 			const state = runtime.ctx.session.getGoalModeState();
 			return state ? `Goal: ${state.goal.status} (${shortDetail(state.goal.objective)})` : "Goal: off";
+		},
+		handle: async (command, runtime) => {
+			if (!runtime.settings.get("goal.enabled")) {
+				await runtime.output("Goal mode is disabled. Enable it in settings (goal.enabled).");
+				return commandConsumed();
+			}
+			const { verb: sub, rest } = parseSubcommand(command.args);
+			const state = runtime.session.getGoalModeState();
+			const setGoalToolEnabled = async (enabled: boolean) => {
+				const tools = runtime.session.getEnabledToolNames().filter(name => name !== "goal");
+				await runtime.session.setActiveToolsByName(enabled ? [...tools, "goal"] : tools);
+			};
+			if (sub === "show" || (!sub && !rest)) {
+				if (!state?.goal) {
+					await runtime.output("No goal set.");
+					return commandConsumed();
+				}
+				const budget =
+					state.goal.tokenBudget === undefined
+						? `${state.goal.tokensUsed.toLocaleString()} tokens used (no budget)`
+						: `${state.goal.tokensUsed.toLocaleString()} / ${state.goal.tokenBudget.toLocaleString()} tokens`;
+				await runtime.output(
+					[
+						`Objective: ${state.goal.objective}`,
+						`Status: ${state.goal.status}${state.enabled ? "" : " (paused)"}`,
+						`Usage: ${budget}`,
+						`Time spent: ${formatDuration(state.goal.timeUsedSeconds * 1000)}`,
+					].join("\n"),
+				);
+				return commandConsumed();
+			}
+			if (sub === "pause") {
+				if (!state?.enabled) {
+					await runtime.output("No active goal to pause.");
+					return commandConsumed();
+				}
+				await runtime.session.goalRuntime.pauseGoal();
+				await setGoalToolEnabled(false);
+				await runtime.output("Goal mode paused.");
+				return commandConsumed();
+			}
+			if (sub === "resume") {
+				if (!state?.goal || state.enabled) {
+					await runtime.output(state?.enabled ? "Goal mode is already active." : "No paused goal to resume.");
+					return commandConsumed();
+				}
+				await runtime.session.goalRuntime.resumeGoal();
+				await setGoalToolEnabled(true);
+				return { prompt: runtime.session.goalRuntime.buildContinuationPrompt() ?? state.goal.objective };
+			}
+			if (sub === "drop") {
+				if (!state?.goal) {
+					await runtime.output("No goal to drop.");
+					return commandConsumed();
+				}
+				await runtime.session.goalRuntime.dropGoal();
+				await setGoalToolEnabled(false);
+				await runtime.output("Goal dropped.");
+				return commandConsumed();
+			}
+			if (sub === "budget") {
+				if (!state?.enabled) {
+					await runtime.output("No active goal.");
+					return commandConsumed();
+				}
+				const value = rest.trim().toLowerCase();
+				const nextBudget = value === "off" ? undefined : Number.parseInt(value, 10);
+				if (value !== "off" && (!Number.isInteger(nextBudget) || (nextBudget ?? 0) <= 0)) {
+					await runtime.output("Goal budget must be a positive integer or `off`.");
+					return commandConsumed();
+				}
+				await runtime.session.goalRuntime.onBudgetMutated(nextBudget);
+				await runtime.output(
+					nextBudget === undefined ? "Goal budget cleared." : `Goal budget set to ${nextBudget}.`,
+				);
+				return commandConsumed();
+			}
+			const objective = (sub === "set" ? rest : command.args).trim();
+			if (!objective) {
+				await runtime.output("Usage: /goal <objective> or /goal set <objective>");
+				return commandConsumed();
+			}
+			if (state?.goal.status === "paused") {
+				await runtime.output("Resume or drop the paused goal before setting a new objective.");
+				return commandConsumed();
+			}
+			const nextState = state?.enabled
+				? await runtime.session.goalRuntime.replaceGoal({ objective })
+				: await runtime.session.goalRuntime.createGoal({ objective });
+			await setGoalToolEnabled(true);
+			runtime.session.setGoalModeState(nextState);
+			return { prompt: objective };
 		},
 		handleTui: async (command, runtime) => {
 			await runtime.ctx.handleGoalModeCommand(command.args || undefined);
@@ -1824,6 +1917,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		description: "Ask an ephemeral side question using the current session context",
 		inlineHint: "<question>",
 		allowArgs: true,
+		handle: async (command, runtime) => {
+			const question = command.args.trim();
+			if (!question) {
+				await runtime.output("Usage: /btw <question>");
+				return commandConsumed();
+			}
+			const promptText = prompt.render(btwUserPrompt, { question });
+			const { replyText } = await runtime.session.runEphemeralTurn({ promptText });
+			await runtime.output(replyText);
+			return commandConsumed();
+		},
 		handleTui: async (command, runtime) => {
 			const question = command.text.slice(`/${command.name}`.length).trim();
 			runtime.ctx.editor.setText("");
